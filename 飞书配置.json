@@ -1,0 +1,14 @@
+{
+  "app_id": "请填写飞书app_id",
+  "app_secret": "请填写飞书app_secret",
+  "app_token": "ADWjbmS5raannVsOiEBcCbYZn7d",
+  "tables": {
+    "店铺户主对应表": "tbl0BoCf7Sp2a83V",
+    "服务商提现批次": "tblItmdZq6s3zCQi",
+    "实际到账登记": "tblEB1H5xOiQRW2V",
+    "店铺提现明细": "tblpdVCNdHWcBqCw",
+    "实时提现审核": "tblXiqYqlue7u5RF",
+    "实时明细": "tblhHlac5RJznSba"
+  }
+}
+
