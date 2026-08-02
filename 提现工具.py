@@ -51,6 +51,16 @@ def number(value, fallback=0.0):
         return fallback
 
 
+def excel_value(value):
+    """Convert Feishu rich values into values that Excel can store safely."""
+    if value is None or isinstance(value, (str, int, float, bool, date, datetime)):
+        return value
+    if isinstance(value, (dict, list)):
+        readable = text(value)
+        return readable if readable else json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 def key_of(row):
     return f'{text(row.get("交易时间"))}||{text(row.get("交易流水号"))}'
 
@@ -98,7 +108,7 @@ def style_sheet(ws, widths):
 def append_rows(ws, headers, rows):
     ws.append(headers)
     for row in rows:
-        ws.append([row.get(h, "") for h in headers])
+        ws.append([excel_value(row.get(h, "")) for h in headers])
 
 
 class Feishu:
