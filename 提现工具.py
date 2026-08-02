@@ -178,6 +178,34 @@ class Feishu:
             result[name] = value
         return result
 
+    def option_maps(self, table_id):
+        """Resolve Feishu lookup/select option IDs to their visible labels."""
+        maps = {}
+        target_cache = {}
+        for field in self.fields(table_id):
+            prop = field.get("property") or {}
+            target_table = (prop.get("filter_info") or {}).get("target_table")
+            target_field_id = prop.get("target_field")
+            if not target_table or not target_field_id:
+                continue
+            if target_table not in target_cache:
+                target_cache[target_table] = self.fields(target_table)
+            target_field = next((x for x in target_cache[target_table] if x.get("field_id") == target_field_id), None)
+            options = ((target_field or {}).get("property") or {}).get("options") or []
+            if options:
+                maps[field.get("field_name")] = {str(x.get("id")): text(x.get("name")) for x in options}
+        return maps
+
+    @staticmethod
+    def visible_value(value, option_map=None):
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return ",".join(filter(None, (Feishu.visible_value(x, option_map) for x in value)))
+        if isinstance(value, dict):
+            return Feishu.visible_value(value.get("name") or value.get("text") or value.get("value") or value.get("id") or "", option_map)
+        return (option_map or {}).get(str(value), value)
+
     def clear(self, table_id):
         ids = [x["record_id"] for x in self.list_records(table_id)]
         for i in range(0, len(ids), 500):
@@ -214,7 +242,12 @@ def load_config():
 
 
 def pull_feishu(feishu, tables):
-    mappings = [x.get("fields", {}) for x in feishu.list_records(tables["店铺户主对应表"])]
+    mapping_table = tables["店铺户主对应表"]
+    option_maps = feishu.option_maps(mapping_table)
+    mappings = [
+        {name: feishu.visible_value(value, option_maps.get(name)) for name, value in x.get("fields", {}).items()}
+        for x in feishu.list_records(mapping_table)
+    ]
     receipts = [x.get("fields", {}) for x in feishu.list_records(tables["实际到账登记"])]
     CACHE_DIR.mkdir(exist_ok=True)
     (CACHE_DIR / "店铺规则.json").write_text(json.dumps(mappings, ensure_ascii=False, indent=2), encoding="utf-8")
