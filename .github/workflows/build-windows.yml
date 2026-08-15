@@ -29,7 +29,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "发布包/每周钱包流水" | Out-Null
           Copy-Item "dist/每周提现工具.exe" "发布包/每周提现工具.exe"
-          Copy-Item "飞书配置.json" "发布包/飞书配置.json"
+          $config = Get-Content "飞书配置.json" -Raw | ConvertFrom-Json
+          if (-not $config.tables.PSObject.Properties["钱包流水"]) {
+            $config.tables | Add-Member -NotePropertyName "钱包流水" -NotePropertyValue "tbl3AgMHFwFoX434"
+          }
+          $config | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 "发布包/飞书配置.json"
           Copy-Item "Windows使用说明.md" "发布包/Windows使用说明.md"
           Set-Content -Encoding UTF8 "发布包/每周钱包流水/请把流水放在这里.txt" "请把 BigSeller 钱包流水放在这里。"
       - uses: actions/upload-artifact@v4

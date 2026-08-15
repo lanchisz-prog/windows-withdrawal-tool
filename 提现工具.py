@@ -295,7 +295,6 @@ def load_config():
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     if config.get("app_id", "").startswith("请填写") or config.get("app_secret", "").startswith("请填写"):
         raise RuntimeError("请先打开“飞书配置.json”，填写 app_id 和 app_secret。")
-    config.setdefault("tables", {}).setdefault("钱包流水", "tbl3AgMHFwFoX434")
     return config
 
 
