@@ -22,11 +22,22 @@ from openpyxl.utils import get_column_letter
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 INPUT_DIR = APP_DIR / "每周钱包流水"
 RESULT_DIR = APP_DIR / "提现结果"
-STATE_PATH = RESULT_DIR / "提现状态台账.json"
 CONFIRM_PATH = APP_DIR / "提现确认登记表.xlsx"
 CONFIG_PATH = APP_DIR / "飞书配置.json"
 CACHE_DIR = APP_DIR / "数据缓存"
+WALLET_CACHE_PATH = CACHE_DIR / "钱包流水.json"
 API = "https://open.feishu.cn/open-apis"
+
+
+def canonical_withdrawal_status(value):
+    value = text(value)
+    if value == "opt1cHQuDn":
+        return "未提现"
+    if value == "optq4ExGVS":
+        return "已发起待到账"
+    if value == "opt956381830":
+        return "规则未配置"
+    return value
 
 
 def text(value):
@@ -63,6 +74,10 @@ def excel_value(value):
 
 def key_of(row):
     return f'{text(row.get("交易时间"))}||{text(row.get("交易流水号"))}'
+
+
+def record_id_of(row):
+    return text(row.get("交易流水号"))
 
 
 def safe_name(value):
@@ -181,6 +196,10 @@ class Feishu:
     def option_maps(self, table_id):
         """Resolve Feishu lookup/select option IDs to their visible labels."""
         maps = {}
+        for field in self.fields(table_id):
+            options = ((field.get("property") or {}).get("options")) or []
+            if options:
+                maps[field.get("field_name")] = {str(x.get("id")): text(x.get("name")) for x in options}
         target_cache = {}
         for field in self.fields(table_id):
             prop = field.get("property") or {}
@@ -233,11 +252,50 @@ class Feishu:
         for i in range(0, len(updates), 500):
             self.request("POST", f"/bitable/v1/apps/{self.app_token}/tables/{table_id}/records/batch_update", {"records": updates[i:i+500]})
 
+    def sync_wallet_ledger(self, table_id, new_rows, status_updates):
+        existing_records = self.list_records(table_id)
+        existing = {text(x.get("fields", {}).get("交易流水号")): x for x in existing_records}
+        creates, updates = [], []
+        for row in new_rows:
+            transaction_id = text(row.get("交易流水号"))
+            if not transaction_id or transaction_id in existing:
+                continue
+            creates.append({
+                "fields": {
+                    "交易流水号": transaction_id,
+                    "店铺名称": text(row.get("店铺名称")),
+                    "交易类型": text(row.get("交易类型")),
+                    "币种": text(row.get("币种")),
+                    "资金流向": text(row.get("资金流向")),
+                    "交易金额": number(row.get("交易金额"), 0),
+                    "交易状态": text(row.get("交易状态")),
+                    "交易时间": self.writable_row(table_id, {"交易时间": row.get("交易时间")}).get("交易时间"),
+                    "数据来源": text(row.get("数据来源")),
+                    "导入日期": self.writable_row(table_id, {"导入日期": row.get("导入日期")}).get("导入日期"),
+                    "提现状态": canonical_withdrawal_status(row.get("提现状态")),
+                },
+            })
+        for row in status_updates:
+            transaction_id = text(row.get("交易流水号"))
+            old = existing.get(transaction_id)
+            if not old:
+                continue
+            updates.append({
+                "record_id": old["record_id"],
+                "fields": {"提现状态": canonical_withdrawal_status(row.get("提现状态"))},
+            })
+        for i in range(0, len(creates), 500):
+            self.request("POST", f"/bitable/v1/apps/{self.app_token}/tables/{table_id}/records/batch_create", {"records": creates[i:i+500]})
+        for i in range(0, len(updates), 500):
+            self.request("POST", f"/bitable/v1/apps/{self.app_token}/tables/{table_id}/records/batch_update", {"records": updates[i:i+500]})
+        return len(existing_records), len(creates), len(updates)
+
 
 def load_config():
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     if config.get("app_id", "").startswith("请填写") or config.get("app_secret", "").startswith("请填写"):
         raise RuntimeError("请先打开“飞书配置.json”，填写 app_id 和 app_secret。")
+    config.setdefault("tables", {}).setdefault("钱包流水", "tbl3AgMHFwFoX434")
     return config
 
 
@@ -249,27 +307,43 @@ def pull_feishu(feishu, tables):
         for x in feishu.list_records(mapping_table)
     ]
     receipts = [x.get("fields", {}) for x in feishu.list_records(tables["实际到账登记"])]
+    wallet_option_maps = feishu.option_maps(tables["钱包流水"])
+    wallet_rows = [
+        {name: feishu.visible_value(value, wallet_option_maps.get(name)) for name, value in x.get("fields", {}).items()}
+        for x in feishu.list_records(tables["钱包流水"])
+    ]
     CACHE_DIR.mkdir(exist_ok=True)
     (CACHE_DIR / "店铺规则.json").write_text(json.dumps(mappings, ensure_ascii=False, indent=2), encoding="utf-8")
     (CACHE_DIR / "实际到账.json").write_text(json.dumps(receipts, ensure_ascii=False, indent=2), encoding="utf-8")
-    return mappings, receipts
+    WALLET_CACHE_PATH.write_text(json.dumps(wallet_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    return mappings, receipts, wallet_rows
 
 
-def load_state(first_run):
-    if first_run or not STATE_PATH.exists():
-        return {"version": 1, "records": {}}
-    return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-
-
-def old_confirmation(first_run):
-    if first_run or not CONFIRM_PATH.exists():
-        return [], []
-    try:
-        return read_rows(CONFIRM_PATH, "服务商提现批次"), read_rows(CONFIRM_PATH, "店铺提现明细")
-    except Exception:
-        return [], []
-
-
+def load_state(wallet_rows):
+    records = {}
+    for row in wallet_rows:
+        transaction_id = record_id_of(row)
+        if not transaction_id:
+            continue
+        records[transaction_id] = {
+            "id": transaction_id,
+            "key": key_of(row),
+            "transactionId": transaction_id,
+            "store": text(row.get("店铺名称")) or "未命名店铺",
+            "transactionType": text(row.get("交易类型")),
+            "currency": text(row.get("币种")),
+            "direction": text(row.get("资金流向")),
+            "sourceStatus": text(row.get("交易状态")),
+            "transactionTime": text(row.get("交易时间")),
+            "originalAmount": number(row.get("交易金额"), 0),
+            "absoluteAmount": amount(row.get("交易金额")),
+            "withdrawalStatus": canonical_withdrawal_status(row.get("提现状态")) or "未提现",
+            "withdrawalBatch": "",
+            "confirmedAt": "",
+            "sourceFile": text(row.get("数据来源")),
+            "importedAt": text(row.get("导入日期")),
+        }
+    return {"version": 2, "records": records}
 def run_process(first_run=False, logger=print):
     INPUT_DIR.mkdir(exist_ok=True)
     RESULT_DIR.mkdir(exist_ok=True)
@@ -278,9 +352,9 @@ def run_process(first_run=False, logger=print):
         raise RuntimeError("每周钱包流水文件夹中没有 Excel 文件。")
     config = load_config()
     tables = config["tables"]
-    logger("连接飞书并读取店铺规则、人工到账登记……")
+    logger("连接飞书并读取店铺规则、人工到账登记、钱包流水主表……")
     feishu = Feishu(config)
-    mappings, receipts = pull_feishu(feishu, tables)
+    mappings, receipts, wallet_rows = pull_feishu(feishu, tables)
     if first_run:
         logger("首次运行：清空飞书程序生成表……")
         for name in ("服务商提现批次", "店铺提现明细", "实时提现审核", "实时明细"):
@@ -291,29 +365,39 @@ def run_process(first_run=False, logger=print):
     if first_run and out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    state = load_state(first_run)
+    state = load_state([] if first_run else wallet_rows)
     seen = set(state["records"])
     imported = duplicate = 0
+    new_wallet_rows = []
     for file in files:
         logger(f"读取：{file.name}")
         for row in read_rows(file):
+            transaction_id = record_id_of(row)
             key = key_of(row)
-            if not text(row.get("交易流水号")) or not text(row.get("交易时间")):
+            absolute_amount = amount(row.get("交易金额"))
+            if not transaction_id or not text(row.get("交易时间")) or absolute_amount <= 0:
                 continue
-            if key in seen:
+            if transaction_id in seen:
                 duplicate += 1
                 continue
-            seen.add(key)
+            seen.add(transaction_id)
             imported += 1
-            state["records"][key] = {
-                "key": key, "transactionId": text(row.get("交易流水号")),
+            record = {
+                "id": transaction_id, "key": key, "transactionId": transaction_id,
                 "store": text(row.get("店铺名称")) or "未命名店铺",
                 "transactionType": text(row.get("交易类型")), "currency": text(row.get("币种")),
                 "direction": text(row.get("资金流向")), "sourceStatus": text(row.get("交易状态")),
                 "transactionTime": text(row.get("交易时间")), "originalAmount": float(row.get("交易金额") or 0),
-                "absoluteAmount": amount(row.get("交易金额")), "withdrawalStatus": "未提现",
+                "absoluteAmount": absolute_amount, "withdrawalStatus": "未提现",
                 "withdrawalBatch": "", "confirmedAt": "", "sourceFile": file.name, "importedAt": run_day,
             }
+            state["records"][transaction_id] = record
+            new_wallet_rows.append({
+                "交易流水号": record["transactionId"], "店铺名称": record["store"], "交易类型": record["transactionType"],
+                "币种": record["currency"], "资金流向": record["direction"], "交易金额": record["originalAmount"],
+                "交易状态": record["sourceStatus"], "交易时间": record["transactionTime"], "提现状态": record["withdrawalStatus"],
+                "数据来源": record["sourceFile"], "导入日期": record["importedAt"],
+            })
 
     rules = {text(x.get("店铺名称")): x for x in mappings if text(x.get("店铺名称"))}
     pending = defaultdict(list)
@@ -323,6 +407,7 @@ def run_process(first_run=False, logger=print):
 
     decisions = []
     realtime_rows = []
+    status_updates = []
     for store in sorted({x["store"] for x in state["records"].values()}):
         rule = rules.get(store, {})
         mode = text(rule.get("提现模式")) or "未配置"
@@ -334,6 +419,10 @@ def run_process(first_run=False, logger=print):
                 key=lambda x: x["transactionTime"],
             )
             for idx, row in enumerate(realtime_store_rows, 1):
+                previous_status = row.get("withdrawalStatus")
+                row["withdrawalStatus"] = "次提人工处理"
+                if previous_status != row["withdrawalStatus"]:
+                    status_updates.append({"交易流水号": row["transactionId"], "提现状态": row["withdrawalStatus"]})
                 realtime_rows.append({"店铺名称": store, "户主姓名": text(rule.get("户主姓名")), "服务商": text(rule.get("服务商")),
                                       "绝对值金额": row["absoluteAmount"], "交易时间": row["transactionTime"], "交易流水号": row["transactionId"],
                                       "原交易金额": row["originalAmount"], "区间顺序": idx, "数据来源": row["sourceFile"], "去重键": row["key"]})
@@ -348,14 +437,21 @@ def run_process(first_run=False, logger=print):
         else:
             should = False
             reason = "提现规则未配置"
+            if total > 0:
+                for row in rows:
+                    previous_status = row["withdrawalStatus"]
+                    row["withdrawalStatus"] = "规则未配置"
+                    if previous_status != row["withdrawalStatus"]:
+                        status_updates.append({"交易流水号": row["transactionId"], "提现状态": row["withdrawalStatus"]})
         decisions.append({"store": store, "rule": rule, "mode": mode, "rows": rows, "total": total, "should": should, "reason": reason})
 
     grouped = defaultdict(list)
     for d in decisions:
         if d["should"]:
             grouped[(text(d["rule"].get("服务商")) or "未配置服务商", d["mode"], "TWD")].append(d)
-    old_batches, old_details = old_confirmation(first_run)
-    used_ids = {text(x.get("服务商批次")) for x in old_batches}
+    existing_batches = [{name: feishu.visible_value(value) for name, value in x.get("fields", {}).items()} for x in feishu.list_records(tables["服务商提现批次"])]
+    existing_details = [{name: feishu.visible_value(value) for name, value in x.get("fields", {}).items()} for x in feishu.list_records(tables["店铺提现明细"])]
+    used_ids = {text(x.get("服务商批次")) for x in existing_batches}
     new_batches, new_details = [], []
     for (provider, mode, currency), items in grouped.items():
         base = f"{run_day}-{provider}-{mode}"
@@ -374,24 +470,37 @@ def run_process(first_run=False, logger=print):
         for d in items:
             store_batch = f'{batch_id}-{d["store"]}'
             for row in d["rows"]:
+                previous_status = row["withdrawalStatus"]
                 row["withdrawalStatus"] = "已发起待到账"
                 row["withdrawalBatch"] = batch_id
+                if previous_status != row["withdrawalStatus"]:
+                    status_updates.append({"交易流水号": row["transactionId"], "提现状态": row["withdrawalStatus"]})
             d["batch"] = batch_id
             new_details.append({"服务商批次": batch_id, "店铺批次": store_batch, "处理日期": run_day, "服务商": provider,
                                 "提现模式": mode, "店铺名称": d["store"], "卖家名称": text(d["rule"].get("卖家名称")),
                                 "户主姓名": text(d["rule"].get("户主姓名")), "应提现金额": d["total"], "店铺状态": "已发起待到账"})
+    merged_batches = {text(x.get("服务商批次")): x for x in existing_batches if text(x.get("服务商批次"))}
+    for row in new_batches:
+        merged_batches[text(row.get("服务商批次"))] = row
+    merged_details = {f'{text(x.get("服务商批次"))}||{text(x.get("店铺批次"))}': x for x in existing_details if text(x.get("服务商批次")) or text(x.get("店铺批次"))}
+    for row in new_details:
+        merged_details[f'{text(row.get("服务商批次"))}||{text(row.get("店铺批次"))}'] = row
+    all_batches = list(merged_batches.values())
+    all_details = list(merged_details.values())
+    build_outputs(out_dir, run_day, decisions, all_batches, receipts, all_details, imported, duplicate, new_batches)
 
-    state.update({"lastRunDate": run_day, "lastImportedNewRows": imported, "lastDuplicateRows": duplicate})
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    build_outputs(out_dir, run_day, decisions, old_batches + new_batches, receipts, old_details + new_details, imported, duplicate, new_batches)
-
-    logger("同步飞书服务商批次和店铺明细……")
-    feishu.sync_by_key(tables["服务商提现批次"], old_batches + new_batches, "服务商批次")
-    feishu.sync_by_key(tables["店铺提现明细"], old_details + new_details, "店铺批次")
+    logger("同步飞书钱包流水主表、服务商批次和店铺明细……")
+    existing_wallet, wallet_created, wallet_updated = feishu.sync_wallet_ledger(tables["钱包流水"], [
+        {**row, "提现状态": next((x["提现状态"] for x in status_updates if x["交易流水号"] == row["交易流水号"]), row["提现状态"])}
+        for row in new_wallet_rows
+    ], status_updates)
+    feishu.sync_by_key(tables["服务商提现批次"], all_batches, "服务商批次")
+    feishu.sync_by_key(tables["店铺提现明细"], all_details, "店铺批次")
     existing_realtime = {text(x.get("fields", {}).get("去重键")) for x in feishu.list_records(tables["实时明细"])}
     feishu.create(tables["实时明细"], [x for x in realtime_rows if x["去重键"] not in existing_realtime])
     return {"导入": imported, "重复": duplicate, "批次": len(new_batches), "店铺明细": len(new_details),
-            "实时明细": len(realtime_rows), "本次提现": sum(x["应提现金额"] for x in new_batches), "结果目录": str(out_dir)}
+            "实时明细": len(realtime_rows), "本次提现": sum(x["应提现金额"] for x in new_batches),
+            "钱包流水已存": existing_wallet, "钱包流水新增": wallet_created, "钱包流水状态更新": wallet_updated, "结果目录": str(out_dir)}
 
 
 def build_outputs(out_dir, run_day, decisions, batches, receipts, details, imported, duplicate, new_batches):
@@ -425,11 +534,11 @@ def build_outputs(out_dir, run_day, decisions, batches, receipts, details, impor
         owner = text(d["rule"].get("户主姓名"))
         start = min((x["transactionTime"][:10] for x in d["rows"]), default=run_day)
         end = max((x["transactionTime"][:10] for x in d["rows"]), default=run_day)
-        filename = f"{safe_name(owner or d['store'])}_提现_{compact_day(start)}_{compact_day(end)}.xlsx" if d["should"] else ""
+        filename = f"{safe_name(owner or d['store'])}_提现_{compact_day(start)}_{compact_day(end)}.xlsx" if d.get("batch") else ""
         ms.append([d["store"], text(d["rule"].get("卖家名称")), owner, text(d["rule"].get("服务商")), d["mode"], len(d["rows"]), d["total"],
                    "已发起待到账" if d["should"] else "未提现", d["reason"], d["total"] if d["should"] else 0,
                    0 if d["should"] else d["total"], d.get("batch", ""), filename])
-        if d["should"]:
+        if d.get("batch"):
             daily = defaultdict(float)
             for row in d["rows"]: daily[row["transactionTime"][:10]] += row["absoluteAmount"]
             owb = Workbook(); ows = owb.active; ows.title = "Sheet1"
