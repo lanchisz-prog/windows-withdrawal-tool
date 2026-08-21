@@ -92,6 +92,8 @@ def compact_day(value):
 def read_rows(path, sheet_name=None):
     wb = load_workbook(path, read_only=True, data_only=False)
     ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.worksheets[0]
+    # BigSeller exports may incorrectly declare the used range as A1:A1.
+    ws.reset_dimensions()
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
     if not rows:
