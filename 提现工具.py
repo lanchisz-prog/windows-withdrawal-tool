@@ -9,7 +9,7 @@ import traceback
 import urllib.error
 import urllib.request
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, Button, Frame, Label, messagebox, scrolledtext, Tk
 
@@ -62,6 +62,31 @@ def number(value, fallback=0.0):
         return fallback
 
 
+def format_time(value):
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    val_str = str(value).strip()
+    if not val_str:
+        return ""
+    try:
+        f_val = float(val_str)
+        if 1_000_000_000 <= f_val <= 3_000_000_000:
+            dt = datetime.fromtimestamp(f_val, tz=timezone(timedelta(hours=8)))
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        elif 1_000_000_000_000 <= f_val <= 3_000_000_000_000:
+            dt = datetime.fromtimestamp(f_val / 1000.0, tz=timezone(timedelta(hours=8)))
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        pass
+    if "/" in val_str:
+        val_str = val_str.replace("/", "-")
+    return val_str
+
+
 def excel_value(value):
     """Convert Feishu rich values into values that Excel can store safely."""
     if value is None or isinstance(value, (str, int, float, bool, date, datetime)):
@@ -73,7 +98,7 @@ def excel_value(value):
 
 
 def key_of(row):
-    return f'{text(row.get("交易时间"))}||{text(row.get("交易流水号"))}'
+    return f'{format_time(row.get("交易时间"))}||{text(row.get("交易流水号"))}'
 
 
 def record_id_of(row):
@@ -188,7 +213,8 @@ class Feishu:
                 try: value = float(value)
                 except (TypeError, ValueError): continue
             elif field.get("type") == 5:
-                try: value = int(datetime.strptime(text(value)[:10], "%Y-%m-%d").timestamp() * 1000)
+                tx_str = format_time(value)[:10]
+                try: value = int(datetime.strptime(tx_str, "%Y-%m-%d").timestamp() * 1000)
                 except ValueError: continue
             elif value is None:
                 value = ""
@@ -335,7 +361,7 @@ def load_state(wallet_rows):
             "currency": text(row.get("币种")),
             "direction": text(row.get("资金流向")),
             "sourceStatus": text(row.get("交易状态")),
-            "transactionTime": text(row.get("交易时间")),
+            "transactionTime": format_time(row.get("交易时间")),
             "originalAmount": number(row.get("交易金额"), 0),
             "absoluteAmount": amount(row.get("交易金额")),
             "withdrawalStatus": canonical_withdrawal_status(row.get("提现状态")) or "未提现",
@@ -376,7 +402,8 @@ def run_process(first_run=False, logger=print):
             transaction_id = record_id_of(row)
             key = key_of(row)
             absolute_amount = amount(row.get("交易金额"))
-            if not transaction_id or not text(row.get("交易时间")) or absolute_amount <= 0:
+            tx_time = format_time(row.get("交易时间"))
+            if not transaction_id or not tx_time or absolute_amount <= 0:
                 continue
             if transaction_id in seen:
                 duplicate += 1
@@ -388,7 +415,7 @@ def run_process(first_run=False, logger=print):
                 "store": text(row.get("店铺名称")) or "未命名店铺",
                 "transactionType": text(row.get("交易类型")), "currency": text(row.get("币种")),
                 "direction": text(row.get("资金流向")), "sourceStatus": text(row.get("交易状态")),
-                "transactionTime": text(row.get("交易时间")), "originalAmount": float(row.get("交易金额") or 0),
+                "transactionTime": tx_time, "originalAmount": float(row.get("交易金额") or 0),
                 "absoluteAmount": absolute_amount, "withdrawalStatus": "未提现",
                 "withdrawalBatch": "", "confirmedAt": "", "sourceFile": file.name, "importedAt": run_day,
             }
